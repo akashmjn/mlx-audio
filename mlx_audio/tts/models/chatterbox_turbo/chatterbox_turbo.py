@@ -33,6 +33,44 @@ NANO_REPO_ID = "ResembleAI/chatterbox-nano"
 VARIANT_REPO_IDS = {"turbo": REPO_ID, "nano": NANO_REPO_ID}
 
 
+def _conds_from_pt(path) -> "Conditionals":
+    """Load Conditionals from a torch conds.pt checkpoint."""
+    import torch
+
+    conds_data = torch.load(path, map_location="cpu", weights_only=True)
+    t3_cond_dict = conds_data.get("t3", {})
+    gen_dict = conds_data.get("gen", {})
+
+    def to_numpy(t):
+        if hasattr(t, "detach"):
+            return t.detach().cpu().numpy()
+        elif hasattr(t, "numpy"):
+            return t.numpy()
+        return np.array(t)
+
+    speaker_emb = t3_cond_dict.get("speaker_emb")
+    if speaker_emb is not None:
+        speaker_emb = mx.array(to_numpy(speaker_emb))
+    else:
+        speaker_emb = mx.array(np.zeros((1, 256), dtype=np.float32))
+
+    cond_tokens = t3_cond_dict.get("cond_prompt_speech_tokens")
+    if cond_tokens is not None:
+        cond_tokens = mx.array(to_numpy(cond_tokens).astype(np.int32))
+
+    gen_mlx = {}
+    for k, v in gen_dict.items():
+        if hasattr(v, "detach") or hasattr(v, "numpy"):
+            gen_mlx[k] = mx.array(to_numpy(v))
+        elif isinstance(v, (int, float)):
+            gen_mlx[k] = v
+
+    return Conditionals(
+        T3Cond(speaker_emb=speaker_emb, cond_prompt_speech_tokens=cond_tokens),
+        gen_mlx,
+    )
+
+
 def _t3_config_for(variant: str) -> T3Config:
     """T3 hyperparameters for a variant name."""
     if variant not in VARIANT_REPO_IDS:
@@ -331,8 +369,10 @@ class ChatterboxTurboTTS(nn.Module):
         except Exception as e:
             logger.warning(f"Could not load S3 speech tokenizer: {e}")
 
-        # Load pre-computed conditionals (prefer safetensors, fallback to .pt)
+        # Load pre-computed conditionals (prefer safetensors, fallback to .pt).
+        # Nano ships only conds.pt.
         builtin_voice_safetensors = model_path / "conds.safetensors"
+        builtin_voice_pt = model_path / "conds.pt"
 
         if builtin_voice_safetensors.exists():
             try:
@@ -360,8 +400,15 @@ class ChatterboxTurboTTS(nn.Module):
             except Exception as e:
                 logger.warning(f"Failed to load conds.safetensors: {e}")
 
+        elif builtin_voice_pt.exists():
+            try:
+                model._conds = _conds_from_pt(builtin_voice_pt)
+                logger.info("Loaded pre-computed conditionals from .pt file")
+            except Exception as e:
+                logger.warning(f"Could not load conditionals: {e}")
+
         else:
-            raise FileNotFoundError("conds.safetensors not found")
+            raise FileNotFoundError("no conds.safetensors or conds.pt found")
         return model
 
     @classmethod
@@ -604,7 +651,7 @@ class ChatterboxTurboTTS(nn.Module):
 
     @classmethod
     def from_pretrained(
-        cls, device: str = "cpu", weights_path: str = None
+        cls, device: str = "cpu", weights_path: str = None, variant: str = "turbo"
     ) -> "ChatterboxTurboTTS":
         """
         Load model from HuggingFace Hub.
@@ -612,6 +659,7 @@ class ChatterboxTurboTTS(nn.Module):
         Args:
             device: Device to use (ignored in MLX)
             weights_path: Optional path to converted model.safetensors
+            variant: "turbo" (GPT2 Medium) or "nano" (GPT2 Small)
 
         Returns:
             ChatterboxTurboTTS instance
@@ -620,7 +668,7 @@ class ChatterboxTurboTTS(nn.Module):
             from huggingface_hub import snapshot_download
 
             local_path = snapshot_download(
-                repo_id=REPO_ID,
+                repo_id=VARIANT_REPO_IDS[variant],
                 token=os.getenv("HF_TOKEN") or True,
                 allow_patterns=["*.safetensors", "*.json", "*.txt", "*.pt", "*.model"],
             )
@@ -634,7 +682,7 @@ class ChatterboxTurboTTS(nn.Module):
                 shutil.copy(weights_path, dest)
                 logger.info(f"Copied converted weights to {dest}")
 
-            return cls.from_local(local_path, device)
+            return cls.from_local(local_path, device, variant=variant)
 
         except ImportError:
             raise ImportError(
