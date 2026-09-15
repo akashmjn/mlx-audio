@@ -26,6 +26,21 @@ logger = logging.getLogger(__name__)
 # Constants
 S3_SR = 16000  # S3Tokenizer sample rate
 REPO_ID = "ResembleAI/chatterbox-turbo"
+NANO_REPO_ID = "ResembleAI/chatterbox-nano"
+
+# Turbo and Nano differ only in the T3 backbone size and where the weights
+# live; everything downstream (S3Gen, VE, tokenizer) is shared.
+VARIANT_REPO_IDS = {"turbo": REPO_ID, "nano": NANO_REPO_ID}
+
+
+def _t3_config_for(variant: str) -> T3Config:
+    """T3 hyperparameters for a variant name."""
+    if variant not in VARIANT_REPO_IDS:
+        raise ValueError(
+            f"Unknown Chatterbox variant {variant!r}; "
+            f"expected one of {sorted(VARIANT_REPO_IDS)}"
+        )
+    return T3Config.nano() if variant == "nano" else T3Config.turbo()
 
 
 def punc_norm(text: str) -> str:
@@ -122,13 +137,17 @@ class ChatterboxTurboTTS(nn.Module):
         if config_or_t3 is None or isinstance(config_or_t3, dict):
             # Initialize from config
             self.config = config_or_t3 or {}
-            hp = T3Config.turbo()
+            self.variant = self.config.get("variant", "turbo")
+            hp = _t3_config_for(self.variant)
             self.t3 = T3(hp)
             self.s3gen = S3Gen(meanflow=True)
             self.ve = VoiceEncoder()
         else:
             # Initialize with individual components
             self.config = {}
+            self.variant = (
+                "nano" if config_or_t3.hp.llama_config_name == "GPT2_small" else "turbo"
+            )
             self.t3 = config_or_t3
             self.s3gen = s3gen if s3gen is not None else S3Gen(meanflow=True)
             self.ve = ve if ve is not None else VoiceEncoder()
@@ -347,7 +366,7 @@ class ChatterboxTurboTTS(nn.Module):
 
     @classmethod
     def from_local(
-        cls, ckpt_dir: Union[str, Path], device: str = "cpu"
+        cls, ckpt_dir: Union[str, Path], device: str = "cpu", variant: str = "turbo"
     ) -> "ChatterboxTurboTTS":
         """
         Load model from local checkpoint directory.
@@ -355,6 +374,7 @@ class ChatterboxTurboTTS(nn.Module):
         Args:
             ckpt_dir: Path to checkpoint directory
             device: Device to use (ignored in MLX, always uses Metal)
+            variant: "turbo" (GPT2 Medium) or "nano" (GPT2 Small)
 
         Returns:
             ChatterboxTurboTTS instance
@@ -364,8 +384,8 @@ class ChatterboxTurboTTS(nn.Module):
         # Load Voice Encoder
         ve = VoiceEncoder()
 
-        # Create T3 config for Turbo
-        hp = T3Config.turbo()
+        # Create T3 config for this variant
+        hp = _t3_config_for(variant)
 
         # Create T3 model
         t3 = T3(hp)

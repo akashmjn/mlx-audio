@@ -235,17 +235,25 @@ class GPT2Model(nn.Module):
         return hidden_states, cache
 
 
-def create_gpt2_config() -> GPT2Config:
-    """Create GPT2 Medium config for T3 Turbo."""
+def create_gpt2_config(hp: Optional[dict] = None) -> GPT2Config:
+    """Create the GPT2 config for a T3 variant.
+
+    Defaults to GPT2 Medium (Turbo). Pass a variant's hyperparameters -- see
+    ``T3Config.gpt2_config`` -- to build a different size, such as Nano's
+    GPT2 Small.
+    """
+    from .t3_config import GPT2_MEDIUM_CONFIG
+
+    hp = hp or GPT2_MEDIUM_CONFIG
     return GPT2Config(
-        vocab_size=50276,
-        n_positions=8196,
-        n_embd=1024,
-        n_layer=24,
-        n_head=16,
-        activation_function="gelu_new",
-        layer_norm_epsilon=1e-5,
-        resid_pdrop=0.1,
-        embd_pdrop=0.1,
-        attn_pdrop=0.1,
+        vocab_size=hp["vocab_size"],
+        n_positions=hp["n_positions"],
+        n_embd=hp["n_embd"],
+        n_layer=hp["n_layer"],
+        n_head=hp["n_head"],
+        activation_function=hp["activation_function"],
+        layer_norm_epsilon=hp["layer_norm_epsilon"],
+        resid_pdrop=hp["resid_pdrop"],
+        embd_pdrop=hp["embd_pdrop"],
+        attn_pdrop=hp["attn_pdrop"],
     )

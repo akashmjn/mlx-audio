@@ -24,8 +24,8 @@ class T3(nn.Module):
             hp = T3Config.turbo()
         self.hp = hp
 
-        # Create GPT2 config
-        self.cfg = create_gpt2_config()
+        # Create GPT2 config for this variant (Turbo: medium, Nano: small)
+        self.cfg = create_gpt2_config(hp.gpt2_config)
         self.dim = self.cfg.hidden_size
 
         # GPT2 backbone
