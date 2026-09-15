@@ -16,6 +16,14 @@ Quantization is selective: only ``t3.tfmr.h.*`` Linear layers are quantized,
 matching the published ``mlx-community/Chatterbox-Turbo-TTS-8bit`` layout. The
 embeddings and heads stay in fp16, as they are sensitive to quantization.
 
+Only T3 is converted. Nano and Turbo ship byte-identical ``ve.safetensors`` and
+``s3gen_meanflow.safetensors``, so ``ve.*`` and ``s3gen.*`` are copied from the
+published MLX Turbo checkpoint instead, which already carries them converted.
+Converting them here would silently produce wrong weights: VoiceEncoder has no
+``sanitize`` to split PyTorch's fused LSTM gates into ``Wx``/``Wh``/``bias``,
+and ``S3Gen.sanitize`` is a shape heuristic that leaves the ``flow.``-prefixed
+estimator blocks unmapped.
+
 S3Tokenizer is not included; it loads at runtime from
 ``mlx-community/S3TokenizerV2``.
 """
@@ -29,12 +37,17 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from mlx_audio.tts.models.chatterbox_turbo import S3Gen, T3, T3Config, VoiceEncoder
+from mlx_audio.tts.models.chatterbox_turbo import T3, T3Config
 from mlx_audio.tts.models.chatterbox_turbo.chatterbox_turbo import (
     VARIANT_REPO_IDS,
     _conds_from_pt,
     _t3_config_for,
 )
+
+# Source of the already-converted ve.* and s3gen.* tensors. Both published
+# builds carry them byte-identically in fp16, so one source serves both.
+GRAFT_REPO_ID = "mlx-community/Chatterbox-Turbo-TTS-fp16"
+GRAFT_PREFIXES = ("ve.", "s3gen.")
 
 # Tokenizer and vocabulary files copied verbatim from the source checkpoint.
 # AutoTokenizer reads these directly; no tokenizer.json needs to be built.
@@ -78,6 +91,13 @@ def download_weights(repo_id: str, cache_dir: Path = None) -> Path:
     )
 
 
+def load_graft_weights(cache_dir: Path = None) -> dict:
+    """Load the already-converted ve.* and s3gen.* tensors from published Turbo."""
+    graft_dir = download_weights(GRAFT_REPO_ID, cache_dir)
+    weights = mx.load(str(graft_dir / "model.safetensors"))
+    return {k: v for k, v in weights.items() if k.startswith(GRAFT_PREFIXES)}
+
+
 def quantize_t3_backbone(model, bits: int = 8, group_size: int = 64) -> int:
     """Quantize only the GPT-2 transformer blocks (``tfmr.h.*``).
 
@@ -96,12 +116,40 @@ def quantize_t3_backbone(model, bits: int = 8, group_size: int = 64) -> int:
     return quantized_count[0]
 
 
-def _load_component(model, weights_path: Path, label: str) -> dict:
+# GPT-2 stores these as Conv1D, whose weight is [in, out]; nn.Linear needs
+# [out, in]. Matched by name, not shape: mlp.c_proj is [inner, n_embd], which
+# already looks like [out, in], and attn.c_proj is square.
+CONV1D_WEIGHTS = (
+    "attn.c_attn.weight",
+    "attn.c_proj.weight",
+    "mlp.c_fc.weight",
+    "mlp.c_proj.weight",
+)
+
+
+def transpose_conv1d_weights(weights: dict) -> dict:
+    """Transpose the GPT-2 Conv1D weights in a T3 state dict to nn.Linear layout."""
+    return {
+        k: (v.T if k.startswith("tfmr.h.") and k.endswith(CONV1D_WEIGHTS) else v)
+        for k, v in weights.items()
+    }
+
+
+def _load_component(
+    model, weights_path: Path, label: str, transpose: bool = False, strict: bool = False
+) -> dict:
     """Load one component's weights, sanitizing them if the class supports it."""
     weights = numpy_to_mlx(load_pytorch_safetensors(weights_path))
+    if transpose:
+        weights = transpose_conv1d_weights(weights)
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
-    model.load_weights(list(weights.items()), strict=False)
+    # T3 loads strict: load_weights does not skip a shape-mismatched key, it
+    # assigns the array anyway, so a bad orientation survives conversion and only
+    # fails later inside quantized_matmul. VoiceEncoder and S3Gen cannot be
+    # strict -- their PyTorch state dicts are keyed differently from the MLX
+    # modules (fused LSTM gates, flow.-prefixed estimator blocks).
+    model.load_weights(list(weights.items()), strict=strict)
     mx.eval(model.parameters())
     print(f"  {label}: {len(weights)} weights from {weights_path.name}")
     return weights
@@ -132,20 +180,12 @@ def convert(
     if not t3_files:
         raise FileNotFoundError(f"No T3 safetensors in {ckpt_dir}")
 
-    # Nano ships both s3gen.safetensors and s3gen_meanflow.safetensors; the
-    # meanflow weights are the ones S3Gen(meanflow=True) expects.
-    s3gen_path = ckpt_dir / "s3gen_meanflow.safetensors"
-    if not s3gen_path.exists():
-        raise FileNotFoundError(f"No s3gen_meanflow.safetensors in {ckpt_dir}")
-
     print("\nLoading components...")
-    ve = VoiceEncoder()
     t3 = T3(hp)
-    s3gen = S3Gen(meanflow=True)
+    _load_component(t3, t3_files[0], "T3", transpose=True, strict=True)
 
-    _load_component(ve, ckpt_dir / "ve.safetensors", "VoiceEncoder")
-    _load_component(t3, t3_files[0], "T3")
-    _load_component(s3gen, s3gen_path, "S3Gen")
+    graft = load_graft_weights(cache_dir)
+    print(f"  ve + s3gen: {len(graft)} weights from {GRAFT_REPO_ID}")
 
     if quantize:
         print(f"\nApplying {bits}-bit quantization to the T3 backbone...")
@@ -153,20 +193,18 @@ def convert(
         mx.eval(t3.parameters())
         print(f"  Quantized {n} Linear layers")
 
-    # Re-flatten from the live models so quantized tensors keep their packed
+    # Re-flatten from the live model so quantized tensors keep their packed
     # uint32 form and every key matches what load_weights expects.
-    new_weights = {}
-    for prefix, component in (("ve", ve), ("t3", t3), ("s3gen", s3gen)):
-        for k, v in tree_flatten(component.parameters()):
-            new_weights[f"{prefix}.{k}"] = v
+    new_weights = {f"t3.{k}": v for k, v in tree_flatten(t3.parameters())}
 
     # Everything not packed into uint32 by quantization is stored as fp16, so a
-    # quantized checkpoint keeps its unquantized components (S3Gen, VE, the
-    # embeddings and heads) at the same width as the fp16 build.
+    # quantized checkpoint keeps its unquantized tensors (the embeddings and
+    # heads) at the same width as the fp16 build.
     new_weights = {
         k: (v.astype(mx.float16) if v.dtype in (mx.float32, mx.bfloat16) else v)
         for k, v in new_weights.items()
     }
+    new_weights.update(graft)
 
     size_gb = sum(v.nbytes for v in new_weights.values()) / 1e9
     print(f"\nSaving {len(new_weights)} tensors ({size_gb:.3f} GB)...")
