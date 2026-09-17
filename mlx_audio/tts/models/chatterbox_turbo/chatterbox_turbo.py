@@ -775,7 +775,7 @@ class ChatterboxTurboTTS(nn.Module):
         Prepare conditioning from a reference audio file or array.
 
         Args:
-            ref_audio: Path to reference audio file or audio array (should be > 5 seconds)
+            ref_audio: Path to reference audio file or audio array (must be > 2.5 seconds)
             sample_rate: Sample rate of audio array (required if ref_audio is array)
             exaggeration: Emotion exaggeration factor (not used in Turbo)
             norm_loudness: Whether to normalize loudness
@@ -797,8 +797,8 @@ class ChatterboxTurboTTS(nn.Module):
                 ref_wav_24k = resample_audio(ref_wav_24k, input_sr, S3GEN_SR)
 
         assert (
-            len(ref_wav_24k) / S3GEN_SR > 5.0
-        ), "Audio prompt must be longer than 5 seconds!"
+            len(ref_wav_24k) / S3GEN_SR > 2.5
+        ), "Audio prompt must be longer than 2.5 seconds!"
 
         if norm_loudness:
             ref_wav_24k = self.norm_loudness(ref_wav_24k, S3GEN_SR)
